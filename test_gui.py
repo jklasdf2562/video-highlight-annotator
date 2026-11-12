@@ -1,61 +1,213 @@
 # -*- coding: utf-8 -*-
-"""无显示集成冒烟测试：导入全部模块、实例化控件、读视频、导出 json + 对比视频。"""
+"""离屏集成测试：恢复、拖动、撤回并重新导出已有标注。"""
+import json
 import os
-import numpy as np
+import shutil
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from time import monotonic, sleep
+from unittest.mock import patch
+
 import cv2
+import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp")
-os.makedirs(tmp, exist_ok=True)
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
-# 1. 合成测试视频 160x90 @30fps, 60 帧
-vid_path = os.path.join(tmp, "0.mp4")
-vw = cv2.VideoWriter(vid_path, cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (160, 90))
-for i in range(60):
-    f = np.full((90, 160, 3), (i * 4 % 255, 90, 90), np.uint8)
-    cv2.putText(f, str(i), (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    vw.write(f)
-vw.release()
+from config import Config, load_saved_annotation, scan_videos
+from exporter import build_line, save_video_json
+from main_window import MainWindow
+from model import Keyframe, Segment, segments_to_predictions
 
-# 2. 导入所有模块
-import config, model, video_reader, exporter, widgets, main_window, main  # noqa
-print("ALL_IMPORTS_OK")
 
-# 3. QApplication + 控件
-from PySide6.QtWidgets import QApplication  # noqa
-app = QApplication([])
-from widgets import VideoView, TimelineView  # noqa
-v = VideoView()
-t = TimelineView()
-t.set_data(60, 30.0, [(10, 20), (30, 40)], [10, 20, 30], 15, 0)
-print("WIDGETS_OK")
+def save_and_wait(win):
+    with patch.object(QMessageBox, "critical") as errors:
+        win.btn_save.click()
+        deadline = monotonic() + 15
+        while win._prog is not None and monotonic() < deadline:
+            QApplication.processEvents()
+            sleep(0.02)
+        assert win._prog is None, "导出超时"
+        assert not errors.called, errors.call_args
 
-# 4. VideoReader
-r = video_reader.VideoReader(vid_path)
-assert r.total == 60, r.total
-fr = r.read(30)
-assert fr is not None and fr.shape == (90, 160, 3)
-print(f"READER_OK total={r.total} fps={r.fps}")
 
-# 5. 导出
-from model import Segment, Keyframe  # noqa
-seg = Segment(10, 40, [Keyframe(10, 0, 20, 80), Keyframe(40, 40, 20, 80)])
-preds = model.segments_to_predictions([seg], 16, 9)
-out_mp4 = os.path.join(tmp, "0_out.mp4")
-n = exporter.render_comparison(vid_path, [seg], 16, 9, out_mp4)
-print(f"RENDER_OK frames={n} exists={os.path.exists(out_mp4)} "
-      f"size={os.path.getsize(out_mp4) if os.path.exists(out_mp4) else 0}")
-exporter.save_video_json(0, 16, 9, preds, tmp)
-exporter.append_jsonl(0, 16, 9, preds, tmp)
-print("EXPORT_OK json=", os.path.exists(os.path.join(tmp, "0.json")),
-      "jsonl=", os.path.exists(os.path.join(tmp, "annotations.jsonl")))
+def drag_timeline(timeline, start_x, end_x, y):
+    before = list(timeline.segments)
+    start = QPoint(round(start_x), y)
+    end = QPoint(round(end_x), y)
+    QTest.mousePress(timeline, Qt.LeftButton, pos=start)
+    QTest.mouseMove(timeline, end)
+    assert timeline.segments == before
+    QTest.mouseRelease(timeline, Qt.LeftButton, pos=end)
 
-# 6. MainWindow 实例化（离线）
-from config import Config  # noqa
-cfg = Config(source_dir=tmp, ratio_dir="", out_dir=tmp, prefill_jsonl="", default_ratio=[16, 9])
-win = main_window.MainWindow(cfg, [(0, "0.mp4", vid_path)], {})
-print(f"MAINWINDOW_OK vid={win.vid} ratio=({win.rw},{win.rh}) "
-      f"total={win.reader.total} segments={len(win.segments)}")
 
-print("\nALL_GUI_TESTS_DONE")
+def drag_segment(timeline, index, mode, frames):
+    s, e = timeline.segments[index]
+    rect = timeline._segment_rect(s, e)
+    x = {"start": rect.left() + 2, "end": rect.right() - 2, "move": rect.center().x()}[mode]
+    drag_timeline(timeline, x, x + timeline._x(frames) - timeline._x(0), round(rect.center().y()))
+
+
+def press_undo(win):
+    QTest.keyClick(win, Qt.Key_Z, Qt.ControlModifier)
+
+
+def check_edit_saved_annotations(tmp):
+    source = tmp / "video"
+    output = tmp / "output"
+    ratios = tmp / "jsonl"
+    source.mkdir()
+    output.mkdir()
+    ratios.mkdir()
+    vid_path = source / "0.mp4"
+    writer = cv2.VideoWriter(str(vid_path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (160, 90))
+    assert writer.isOpened()
+    for i in range(60):
+        frame = np.full((90, 160, 3), (i * 4 % 255, 90, 90), np.uint8)
+        writer.write(frame)
+    writer.release()
+    for vid in (1, 2, 3):
+        shutil.copyfile(vid_path, source / f"{vid}.mp4")
+
+    segments = [
+        Segment(10, 40, [Keyframe(10, 0, 20, 40), Keyframe(15, 38, 24, 44),
+                         Keyframe(40, 40, 20, 40)]),
+        Segment(42, 45, [Keyframe(42, 10, 20, 40)]),
+    ]
+    original = segments_to_predictions(segments, 1, 1)
+    save_video_json(0, 1, 1, original, output)
+    save_video_json(1, 16, 9, [], output)
+    (output / "3.json").write_text("{", encoding="utf-8")
+    (ratios / "0.jsonl").write_text('{"targetRatioWH":[16,9]}\n', encoding="utf-8")
+    summary = output / "annotations.jsonl"
+    old_row = build_line(0, 1, 1, original)
+    other_row = build_line(1, 16, 9, [])
+    summary.write_text("".join(json.dumps(row) + "\n" for row in (old_row, other_row, old_row)),
+                       encoding="utf-8")
+    prefill = {vid: build_line(vid, 4, 3, [{"frame": 7, "bboxes": [0, 0, 40]}])
+               for vid in (0, 1, 2)}
+
+    cfg = Config(source_dir=str(source), ratio_dir=str(ratios), out_dir=str(output))
+    win = MainWindow(cfg, scan_videos(source), prefill)
+    try:
+        win.show()
+        QApplication.processEvents()
+        assert all(b.text() != "清空标注" for b in win.findChildren(QPushButton))
+        assert win.vid == 2 and win.timeline.segments == [(7, 7)]
+        assert (win.rw, win.rh) == (4, 3)
+        assert win.reader.read(30).shape == (90, 160, 3)
+        win.sidebar.itemClicked.emit(win.sidebar.item(1))
+        assert win.vid == 1 and not win.segments
+        with patch.object(QMessageBox, "critical") as error:
+            win.sidebar.itemClicked.emit(win.sidebar.item(3))
+            assert error.called and win.vid == 1 and win.sidebar.currentRow() == 1
+
+        win.sidebar.itemClicked.emit(win.sidebar.item(0))
+        assert win.vid == 0 and win.playhead == 10
+        assert (win.rw, win.rh) == (1, 1)
+        assert win.timeline.segments == [(10, 40), (42, 45)]
+        assert segments_to_predictions(win.segments, win.rw, win.rh) == original
+
+        timeline = win.timeline
+        win.on_seek(2)
+        win.btn_mark.click()
+        win.on_seek(6)
+        win.btn_mark.click()
+        assert timeline.segments == [(2, 6), (10, 40), (42, 45)]
+        press_undo(win)
+        assert win.open_start == 2 and timeline.segments == [(10, 40), (42, 45)]
+        press_undo(win)
+        assert win.open_start is None
+
+        win.on_seek(43)
+        win.btn_add_kf.click()
+        assert [k.frame for k in win.segments[1].keyframes] == [42, 43]
+        win.btn_del_kf.click()
+        assert [k.frame for k in win.segments[1].keyframes] == [42]
+        press_undo(win)
+        assert [k.frame for k in win.segments[1].keyframes] == [42, 43]
+        press_undo(win)
+        assert [k.frame for k in win.segments[1].keyframes] == [42]
+
+        _, _, bar_y, _ = timeline._bar()
+        drag_timeline(timeline, timeline._x(2), timeline._x(18), bar_y - 6)
+        assert win.playhead == 18 and timeline.segments == [(10, 40), (42, 45)]
+
+        win.toggle_play()
+        drag_segment(timeline, 0, "start", 1)
+        assert not win._playing and win.playhead == 11
+        win.on_seek(20)
+        press_undo(win)
+        assert win.playhead == 10 and timeline.segments == [(10, 40), (42, 45)]
+        assert segments_to_predictions(win.segments, win.rw, win.rh) == original
+        drag_segment(timeline, 0, "start", 1)
+        drag_segment(timeline, 0, "end", -4)
+        assert win.playhead == 36 and timeline.segments == [(11, 36), (42, 45)]
+        retained = [p for p in original if 11 <= p["frame"] <= 36]
+        assert segments_to_predictions(win.segments[:1], win.rw, win.rh) == retained
+
+        drag_segment(timeline, 0, "end", 14)
+        assert win.playhead == 41 and timeline.segments == [(11, 41), (42, 45)]
+        extended = segments_to_predictions(win.segments[:1], win.rw, win.rh)
+        assert extended == retained + [{"frame": f, "bboxes": retained[-1]["bboxes"]}
+                                       for f in range(37, 42)]
+
+        drag_segment(timeline, 0, "move", -20)
+        assert timeline.segments == [(0, 30), (42, 45)]
+        assert segments_to_predictions(win.segments[:1], win.rw, win.rh) == [
+            {**p, "frame": p["frame"] - 11} for p in extended
+        ]
+        drag_segment(timeline, 1, "move", 16)
+        assert timeline.segments == [(0, 30), (56, 59)]
+        assert load_saved_annotation(output, 0) == old_row
+
+        win.on_seek(57)
+        win.btn_undo.click()
+        assert timeline.segments == [(0, 30)]
+        press_undo(win)
+        assert timeline.segments == [(0, 30), (56, 59)]
+        press_undo(win)
+        assert timeline.segments == [(0, 30), (42, 45)]
+        win.on_seek(43)
+        win.btn_undo.click()
+        win.on_seek(0)
+        before_crop = segments_to_predictions(win.segments, win.rw, win.rh)
+        win.video_view.boxChanged.emit(4, 20, 40)
+        win.video_view.boxChanged.emit(4, 20, 40)
+        press_undo(win)
+        assert segments_to_predictions(win.segments, win.rw, win.rh) == before_crop
+        win.video_view.boxChanged.emit(4, 20, 40)
+        edited = segments_to_predictions(win.segments, win.rw, win.rh)
+        assert edited[0]["bboxes"] == [4, 20, 40]
+        assert [p["frame"] for p in edited] == list(range(31))
+
+        save_and_wait(win)
+        assert win.vid == 1
+        press_undo(win)
+        assert not win.segments and win.open_start is None
+        saved = load_saved_annotation(output, 0)
+        assert saved["predictions"] == edited
+        assert [json.loads(line) for line in summary.read_text(encoding="utf-8").splitlines()] == [
+            saved, other_row,
+        ]
+        assert (output / "0.mp4").stat().st_size > 0
+
+        win.sidebar.itemClicked.emit(win.sidebar.item(0))
+        press_undo(win)
+        assert segments_to_predictions(win.segments, win.rw, win.rh) == edited
+        print("LOAD_DRAG_UNDO_RESAVE_OK")
+    finally:
+        if win.reader:
+            win.reader.release()
+        win.close()
+
+
+if __name__ == "__main__":
+    app = QApplication([])
+    tmp_root = Path(__file__).resolve().parent / "_tmp"
+    tmp_root.mkdir(exist_ok=True)
+    with TemporaryDirectory(dir=tmp_root) as tmp:
+        check_edit_saved_annotations(Path(tmp))

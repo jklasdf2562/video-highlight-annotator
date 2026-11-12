@@ -121,6 +121,76 @@ def predictions_to_model(preds, gap=2, max_kf=20):
     return segs
 
 
+def _restore_segment(boxes):
+    """仅移除可由现有插值规则精确重建的逐帧裁剪框。"""
+    keyframes = [boxes[0]]
+    spans = [(0, len(boxes) - 1)]
+    while spans:
+        start, end = spans.pop()
+        if start == end:
+            continue
+        endpoints = (boxes[start], boxes[end])
+        if all(interp_box(endpoints, k.frame) == (k.x, k.y, k.w)
+               for k in boxes[start + 1:end]):
+            keyframes.append(boxes[end])
+        else:
+            mid = (start + end) // 2
+            spans.extend(((mid, end), (start, mid)))
+
+    # 末关键帧之后本来就保持位置，重复的末帧可以省去。
+    if len(keyframes) > 1:
+        prev, last = keyframes[-2:]
+        if (prev.x, prev.y, prev.w) == (last.x, last.y, last.w):
+            keyframes.pop()
+    return Segment(boxes[0].frame, boxes[-1].frame, keyframes)
+
+
+def move_segment(segment, start):
+    """整体平移，保持片段长度和裁剪框相对于片段的位置。"""
+    delta = start - segment.start
+    keyframes = [Keyframe(k.frame + delta, k.x, k.y, k.w) for k in segment.keyframes]
+    return Segment(start, segment.end + delta, keyframes)
+
+
+def resize_segment(segment, start, end):
+    """调整闭区间，保留覆盖帧的裁剪框，新增帧沿用端点框。"""
+    original = segment.sorted_kf()
+    retained = [k for k in original if start <= k.frame <= end]
+    if len(retained) == len(original):
+        return Segment(start, end, retained)
+
+    def restore_span(first, last):
+        boxes = [Keyframe(f, *interp_box(original, f)) for f in range(first, last + 1)]
+        return _restore_segment(boxes).keyframes
+
+    # 裁断插值区间时，直接用新边界插值可能因取整改变剩余帧的框。
+    # 仅重建被裁断的插值区间，保留片段内部的关键帧。
+    if not retained:
+        retained = restore_span(start, end)
+    else:
+        first, last = retained[0].frame, retained[-1].frame
+        if original[0].frame < start < first:
+            retained = [k for k in restore_span(start, first) if k.frame < first] + retained
+        if last < end < original[-1].frame:
+            retained.extend(restore_span(last, end)[1:])
+    return Segment(start, end, retained)
+
+
+def saved_predictions_to_model(preds):
+    """按导出的帧顺序恢复高光段，保留缺帧和重叠段的记录。"""
+    segments = []
+    boxes = []
+    for pred in preds:
+        frame = pred["frame"]
+        if boxes and frame != boxes[-1].frame + 1:
+            segments.append(_restore_segment(boxes))
+            boxes = []
+        boxes.append(Keyframe(frame, *pred["bboxes"]))
+    if boxes:
+        segments.append(_restore_segment(boxes))
+    return segments
+
+
 def segments_to_predictions(segments, rw, rh):
     """把 [Segment...] 展开为官方格式 predictions（每帧一个 bbox）。"""
     preds = []

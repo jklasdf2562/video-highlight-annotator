@@ -89,3 +89,31 @@ def load_prefill(prefill_jsonl):
             except Exception:
                 continue
     return data
+
+
+def load_saved_annotation(out_dir, vid):
+    """读取工具导出的单视频标注；文件不存在时返回 None。"""
+    path = os.path.join(out_dir, f"{vid}.json")
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if str(data["video_id"]) != str(vid):
+            raise ValueError("video_id 与当前视频编号不匹配")
+        rw, rh = data["targetRatioWH"]
+        if type(rw) is not int or type(rh) is not int or min(rw, rh) <= 0:
+            raise ValueError("targetRatioWH 必须是两个正整数")
+        predictions = data["predictions"]
+        if not isinstance(predictions, list):
+            raise ValueError("predictions 必须是列表")
+        for pred in predictions:
+            frame = pred["frame"]
+            x, y, w = pred["bboxes"]
+            if (type(frame) is not int or frame < 0
+                    or any(type(v) is not int for v in (x, y, w))
+                    or min(x, y) < 0 or w <= 0):
+                raise ValueError("predictions 中的 frame 或 bboxes 无效")
+    except FileNotFoundError:
+        return None
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{path}：{exc}") from exc
+    return data

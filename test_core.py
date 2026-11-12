@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """无 GUI 核心逻辑自测（仅 stdlib，可用系统 python 运行）。"""
+import json
 import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from model import (
     Keyframe, Segment, interp_box, box_height, default_keyframe,
-    clamp_box, predictions_to_model, segments_to_predictions,
+    clamp_box, resize_segment, predictions_to_model, saved_predictions_to_model, segments_to_predictions,
 )
-from config import load_ratio, load_prefill
+from config import load_ratio, load_prefill, load_saved_annotation
 
 ok = True
 
@@ -54,20 +57,44 @@ check("roundtrip bbox exact",
 # 5. clamp
 check("clamp", clamp_box(-5, -5, 100, 100, 720, 1280) == (0, 0, 100, 100))
 
-# 6. 读官方比例
-r = load_ratio(r"C:\Users\luo\OneDrive\Desktop\jsonl", 0)
-check("ratio vid0", r == [16, 9], f"got {r}")
-r = load_ratio(r"C:\Users\luo\OneDrive\Desktop\jsonl", 20)
-check("ratio vid20", r == [9, 16], f"got {r}")
+# 6. 逐帧还原保存结果，保留单帧间隙和重叠段
+saved_preds = [{"frame": f, "bboxes": [f % 2, 8, 40]} for f in range(1, 26)]
+saved_preds += [{"frame": f, "bboxes": [2, 4, 48]} for f in (27, 28, 28)]
+restored = saved_predictions_to_model(saved_preds)
+check("saved segment ranges", [(s.start, s.end) for s in restored] == [(1, 25), (27, 28), (28, 28)])
+check("saved bbox roundtrip", segments_to_predictions(restored, 9, 16) == saved_preds)
+check("fixed box has one keyframe", len(restored[1].keyframes) == 1)
 
-# 7. 读预填
-pre = load_prefill(r"C:\Users\luo\OneDrive\Desktop\比赛\426\github_ours_0-425.jsonl")
-check("prefill loaded", len(pre) > 0, f"got {len(pre)}")
-if pre:
-    v0 = pre.get(0)
-    check("prefill vid0 has predictions", v0 is not None and bool(v0.get("predictions")))
-    print("    prefill vid0 ratio:", v0.get("targetRatioWH") if v0 else None,
-          "n_pred:", len(v0.get("predictions", [])) if v0 else 0)
+# 裁掉插值端点时仍精确保留逐帧框，包括只剩一帧的片段。
+clip = Segment(0, 10, [Keyframe(0, 0, 0, 20), Keyframe(5, 2, 0, 20), Keyframe(10, 0, 0, 20)])
+clip_preds = segments_to_predictions([clip], 16, 9)
+trimmed = resize_segment(clip, 1, 9)
+check("trim preserves rounded crops", segments_to_predictions([trimmed], 16, 9) == clip_preds[1:10])
+check("trim keeps interior keyframe", clip.keyframes[1] in trimmed.keyframes)
+check("trim to one frame", segments_to_predictions([resize_segment(clip, 4, 4)], 16, 9) == clip_preds[4:5])
+
+# 7. 官方比例、预填和保存结果使用临时文件自测
+tmp_root = Path(__file__).resolve().parent / "_tmp"
+tmp_root.mkdir(exist_ok=True)
+with TemporaryDirectory(dir=tmp_root) as tmp:
+    folder = Path(tmp)
+    row = {"video_id": "0", "targetRatioWH": [9, 16], "predictions": saved_preds}
+    (folder / "0.jsonl").write_text(json.dumps({"targetRatioWH": [16, 9]}) + "\n", encoding="utf-8")
+    prefill = folder / "prefill.jsonl"
+    prefill.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    check("official ratio", load_ratio(folder, 0) == [16, 9])
+    check("prefill loaded", load_prefill(prefill) == {0: row})
+    check("missing output json", load_saved_annotation(folder, 0) is None)
+    saved_file = folder / "0.json"
+    saved_file.write_text(json.dumps(row), encoding="utf-8-sig")
+    check("output json loaded", load_saved_annotation(folder, 0) == row)
+    saved_file.write_text(json.dumps({**row, "video_id": "1"}), encoding="utf-8")
+    try:
+        load_saved_annotation(folder, 0)
+    except ValueError:
+        check("reject mismatched output id", True)
+    else:
+        check("reject mismatched output id", False)
 
 print("\nRESULT:", "ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

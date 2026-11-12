@@ -4,7 +4,7 @@ import cv2
 
 from PySide6.QtCore import Qt, Signal, QRectF
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QApplication, QWidget
 
 
 def bgr_to_qimage(bgr):
@@ -58,6 +58,9 @@ class VideoView(QWidget):
     def set_ratio(self, rw, rh):
         self.rw, self.rh = rw, rh
         self.update()
+
+    def reset_interaction(self):
+        self._mode = None
 
     # ---- 坐标换算 ----
     def _scale_offsets(self):
@@ -195,10 +198,12 @@ class VideoView(QWidget):
 
 
 class TimelineView(QWidget):
-    """可拖动时间轴：高光段、裁剪关键帧、播放头。"""
+    """时间轴：定位播放头、移动高光段和调整片段边界。"""
 
     seekRequested = Signal(int)
     segmentClicked = Signal(int)
+    segmentDragStarted = Signal()
+    segmentEdited = Signal(int, str, int, int, int)  # index, mode, start, end, playhead
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -208,10 +213,17 @@ class TimelineView(QWidget):
         self.keyframes = []      # [frame, ...] 关键帧帧号
         self.playhead = 0
         self.selected = -1
+        self._scrubbing = False
+        self._drag = None  # (index, mode, press_x, press_frame)
+        self._drag_range = None
         self.setMinimumHeight(92)
+        self.setMouseTracking(True)
+        self.setToolTip("拖动高光两端调整起止帧，拖动中间移动整段。拖动刻度或空白处定位。")
 
     def set_data(self, total, fps, segments, keyframes, playhead, selected):
-        self.total = max(1, total)
+        if self.total != total or self.segments != segments:
+            self.reset_interaction()
+        self.total = total
         self.fps = fps if fps else 30.0
         self.segments = segments
         self.keyframes = keyframes
@@ -219,18 +231,30 @@ class TimelineView(QWidget):
         self.selected = selected
         self.update()
 
+    def reset_interaction(self):
+        self._scrubbing = False
+        self._drag = None
+        self._drag_range = None
+        self.unsetCursor()
+        self.update()
+
     def _bar(self):
         pad = 14
-        return pad, self.width() - 2 * pad, 40, self.height() - 40 - 26
+        return pad, max(1, self.width() - 2 * pad), 40, self.height() - 40 - 26
 
     def _x(self, frame):
         bx, bw, by, bh = self._bar()
-        return bx + (frame / self.total) * bw
+        return bx + (frame / max(1, self.total)) * bw
 
     def _frame_at(self, px):
         bx, bw, by, bh = self._bar()
         f = (px - bx) / bw * self.total
         return int(round(max(0, min(self.total - 1, f))))
+
+    def _segment_rect(self, start, end):
+        _, _, by, bh = self._bar()
+        left = self._x(start)
+        return QRectF(left, by, self._x(end + 1) - left, bh)
 
     def paintEvent(self, e):
         p = QPainter(self)
@@ -244,10 +268,23 @@ class TimelineView(QWidget):
 
         # 高光段
         for i, (s, e) in enumerate(self.segments):
+            if s >= self.total or e < 0:
+                continue
             col = QColor(255, 170, 40) if i == self.selected else QColor(255, 138, 0)
-            p.setBrush(col)
-            sx = self._x(s); ex = max(sx + 1, self._x(min(e, self.total - 1)))
-            p.drawRect(int(sx), by, int(ex - sx), bh)
+            rect = self._segment_rect(max(s, 0), min(e, self.total - 1))
+            p.fillRect(rect, col)
+            if i == self.selected:
+                handle = min(3, rect.width() / 4)
+                for x in (rect.left(), rect.right() - handle):
+                    p.fillRect(QRectF(x, by + bh / 4, handle, bh / 2), QColor(255, 230, 180))
+
+        # 拖动期间预览目标区间，松手后才提交修改。
+        if self._drag_range is not None:
+            rect = self._segment_rect(*self._drag_range)
+            p.fillRect(rect, QColor(255, 210, 140, 110))
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(255, 230, 180), 1, Qt.DashLine))
+            p.drawRect(rect)
 
         # 关键帧标记（菱形）
         p.setPen(QPen(QColor(80, 200, 255), 2))
@@ -259,7 +296,8 @@ class TimelineView(QWidget):
             p.drawLine(cx, by + 6, cx - 5, by)
 
         # 播放头
-        px = self._x(min(self.playhead, self.total - 1))
+        last_frame = max(0, self.total - 1)
+        px = self._x(min(self.playhead, last_frame))
         p.setPen(QPen(QColor(255, 255, 255), 2))
         p.drawLine(int(px), by - 6, int(px), by + bh + 6)
         p.setBrush(QColor(255, 255, 255))
@@ -279,25 +317,126 @@ class TimelineView(QWidget):
         # 当前时间
         cur = self.playhead / self.fps
         mm, ss = int(cur // 60), int(cur % 60)
-        p.drawText(bx, by - 12, f"t = {mm}:{ss:02d}  帧 {self.playhead}/{self.total - 1}")
+        label = f"t = {mm}:{ss:02d}  帧 {self.playhead}/{last_frame}"
+        if self._drag_range is not None:
+            s, e = self._drag_range
+            label += f"  ·  高光 {s}–{e} 帧"
+        p.drawText(bx, by - 12, label)
+
+    def _segment_hit(self, px, py):
+        _, _, by, bh = self._bar()
+        if not by <= py < by + bh:
+            return None
+        for i, (s, e) in enumerate(self.segments):
+            if not 0 <= s <= e < self.total:
+                continue
+            rect = self._segment_rect(s, e)
+            if rect.left() <= px < rect.right():
+                edge = min(7, rect.width() / 3)
+                if px - rect.left() < edge:
+                    return i, "start"
+                if rect.right() - px <= edge:
+                    return i, "end"
+                return i, "move"
+        return None
+
+    def _update_cursor(self, hit, dragging=False):
+        if hit is None:
+            self.unsetCursor()
+        elif hit[1] == "move":
+            self.setCursor(Qt.ClosedHandCursor if dragging else Qt.OpenHandCursor)
+        else:
+            self.setCursor(Qt.SizeHorCursor)
 
     def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton:
-            self._seek(e.position().x(), e.position().y())
+        if e.button() != Qt.LeftButton or self.total <= 0:
+            return
+        self.reset_interaction()
+        px, py = e.position().x(), e.position().y()
+        frame = self._frame_at(px)
+        hit = self._segment_hit(px, py)
+        if hit is None:
+            self._scrubbing = True
+            self._seek(frame)
+            return
+        index, mode = hit
+        start, end = self.segments[index]
+        if mode == "start":
+            frame = start
+        elif mode == "end":
+            frame = end
+        else:
+            frame = min(end, max(start, frame))
+        self._drag = (index, mode, px, frame)
+        self._update_cursor(hit)
+        self._seek(frame, index)
 
     def mouseMoveEvent(self, e):
+        px, py = e.position().x(), e.position().y()
         if e.buttons() & Qt.LeftButton:
-            self._seek(e.position().x(), e.position().y())
+            if self._drag is not None:
+                self._preview_drag(px)
+            elif self._scrubbing:
+                self._seek(self._frame_at(px))
+        else:
+            self._update_cursor(self._segment_hit(px, py))
 
-    def _seek(self, px, py):
-        f = self._frame_at(px)
-        # 若点在高光段内则选中该段
-        sel = -1
-        for i, (s, e) in enumerate(self.segments):
-            if s <= f <= e:
-                sel = i
-                break
-        if sel != self.selected:
-            self.selected = sel
-            self.segmentClicked.emit(sel)
-        self.seekRequested.emit(f)
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            return
+        px, py = e.position().x(), e.position().y()
+        if self._drag is not None:
+            self._preview_drag(px)
+            index, mode, _, frame = self._drag
+            proposed = self._drag_range
+            old_start, old_end = self.segments[index]
+            self.reset_interaction()
+            if proposed is not None and proposed != (old_start, old_end):
+                start, end = proposed
+                playhead = end if mode == "end" else frame + start - old_start
+                self.segmentEdited.emit(index, mode, start, end, playhead)
+        elif self._scrubbing:
+            self.reset_interaction()
+            frame = self._frame_at(px)
+            if frame != self.playhead:
+                self._seek(frame)
+        self._update_cursor(self._segment_hit(px, py))
+
+    def _preview_drag(self, px):
+        index, mode, press_x, _ = self._drag
+        distance = px - press_x
+        _, width, _, _ = self._bar()
+        delta = round(distance * self.total / width)
+        if self._drag_range is None:
+            if delta == 0 or (mode == "move" and abs(distance) < QApplication.startDragDistance()):
+                return
+            self.segmentDragStarted.emit()
+            self._update_cursor((index, mode), dragging=True)
+
+        start, end = self.segments[index]
+        lower, upper = 0, self.total - 1
+        # 允许编辑已有的重叠段，但不因拖动增加与其他段的重叠。
+        for other, (s, e) in enumerate(self.segments):
+            if other == index:
+                continue
+            if s < start:
+                lower = max(lower, min(start, e + 1))
+            if e > end:
+                upper = min(upper, max(end, s - 1))
+        if mode == "start":
+            start = min(end, max(lower, start + delta))
+        elif mode == "end":
+            end = max(start, min(upper, end + delta))
+        else:
+            delta = max(lower - start, min(upper - end, delta))
+            start, end = start + delta, end + delta
+        self._drag_range = (start, end)
+        self.update()
+
+    def _seek(self, frame, index=None):
+        if index is None:
+            index = next((i for i, (s, e) in enumerate(self.segments) if s <= frame <= e), -1)
+        if index != self.selected:
+            self.selected = index
+            self.segmentClicked.emit(index)
+        self.seekRequested.emit(frame)

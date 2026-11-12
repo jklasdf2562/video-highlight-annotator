@@ -3,11 +3,12 @@
 import os
 import json
 import subprocess
+import tempfile
 
 import numpy as np
 import cv2
 
-from model import interp_box, box_height, segments_to_predictions
+from model import interp_box, box_height
 
 
 def build_line(video_id, rw, rh, predictions):
@@ -18,21 +19,52 @@ def build_line(video_id, rw, rh, predictions):
     }
 
 
+def _write_text(path, text):
+    """写入完成后替换旧文件，避免半写入的结果覆盖已有标注。"""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 def save_video_json(video_id, rw, rh, predictions, out_dir):
     line = build_line(video_id, rw, rh, predictions)
     os.makedirs(out_dir, exist_ok=True)
     p = os.path.join(out_dir, f"{video_id}.json")
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(line, f, ensure_ascii=False, indent=2)
+    _write_text(p, json.dumps(line, ensure_ascii=False, indent=2))
     return p
 
 
-def append_jsonl(video_id, rw, rh, predictions, out_dir):
-    line = build_line(video_id, rw, rh, predictions)
+def update_jsonl(video_id, rw, rh, predictions, out_dir):
+    """替换当前视频的汇总记录，并清除该视频旧的重复记录。"""
+    line = json.dumps(build_line(video_id, rw, rh, predictions), ensure_ascii=False)
     os.makedirs(out_dir, exist_ok=True)
     p = os.path.join(out_dir, "annotations.jsonl")
-    with open(p, "a", encoding="utf-8") as f:
-        f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    try:
+        with open(p, encoding="utf-8-sig") as f:
+            old_lines = f.readlines()
+    except FileNotFoundError:
+        old_lines = []
+    lines = []
+    replaced = False
+    for old_line in old_lines:
+        try:
+            entry = json.loads(old_line)
+        except json.JSONDecodeError:
+            entry = None
+        if isinstance(entry, dict) and str(entry.get("video_id")) == str(video_id):
+            if not replaced:
+                lines.append(line + "\n")
+                replaced = True
+        else:
+            lines.append(old_line.rstrip("\n") + "\n")
+    if not replaced:
+        lines.append(line + "\n")
+    _write_text(p, "".join(lines))
     return p
 
 
@@ -115,6 +147,9 @@ def render_comparison(video_path, segments, rw, rh, out_mp4, progress_cb=None):
         use_ffmpeg = False
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         vw = cv2.VideoWriter(out_mp4, fourcc, fps, (CW, CH))
+        if not vw.isOpened():
+            cap.release()
+            raise RuntimeError("无法写入对比视频")
 
     idx = 0
     while True:
@@ -168,7 +203,10 @@ def render_comparison(video_path, segments, rw, rh, out_mp4, progress_cb=None):
 
     if use_ffmpeg:
         pipe.stdin.close()
-        pipe.wait()
+        status = pipe.wait()
+        if status != 0:
+            cap.release()
+            raise RuntimeError(f"ffmpeg 退出码：{status}")
     else:
         vw.release()
     cap.release()

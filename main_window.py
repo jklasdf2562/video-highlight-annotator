@@ -1,25 +1,28 @@
 # -*- coding: utf-8 -*-
 """主窗口：视频打标界面，按钮/时间轴/裁剪框/预览/保存下一个。"""
 import os
+import tempfile
 import threading
+from copy import deepcopy
 
 import cv2
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QPixmap, QKeySequence, QShortcut, QColor
+from PySide6.QtGui import QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout,
-    QMessageBox, QProgressDialog, QSizePolicy, QFrame, QListWidget, QListWidgetItem,
+    QMessageBox, QProgressDialog, QSizePolicy, QListWidget, QListWidgetItem,
 )
 
 from video_reader import VideoReader
 from widgets import VideoView, TimelineView, bgr_to_qimage
 from model import (
     Segment, Keyframe, interp_box, box_height, default_keyframe,
-    predictions_to_model, segments_to_predictions,
+    move_segment, resize_segment,
+    predictions_to_model, saved_predictions_to_model, segments_to_predictions,
 )
-from config import load_ratio
-from exporter import save_video_json, append_jsonl, render_comparison
+from config import load_ratio, load_saved_annotation
+from exporter import save_video_json, update_jsonl, render_comparison
 
 
 class MainWindow(QMainWindow):
@@ -31,10 +34,6 @@ class MainWindow(QMainWindow):
 
     def __init__(self, cfg, video_list, prefill):
         super().__init__()
-        self.cfg = cfg
-        self.video_list = video_list   # [(vid, fn, path)]
-        self.prefill = prefill         # {vid: {'targetRatioWH':[..], 'predictions':[..]}}
-
         self.reader = None
         self.vid = None
         self.index = -1
@@ -43,6 +42,7 @@ class MainWindow(QMainWindow):
         self.open_start = None
         self.playhead = 0
         self.selected = -1
+        self._undo_history = []
 
         self._playing = False
         self._prog = None
@@ -56,11 +56,7 @@ class MainWindow(QMainWindow):
         self._done.connect(self._on_done)
         self._error.connect(self._on_error)
 
-        if not self.video_list:
-            QMessageBox.critical(self, "错误", "源视频文件夹里没有找到视频。")
-            return
-        start = self._first_unannotated()
-        self.load_video(start)
+        self.reload(cfg, video_list, prefill)
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -142,6 +138,9 @@ class MainWindow(QMainWindow):
         sc_left.activated.connect(lambda: self.step(-1))
         sc_right = QShortcut(QKeySequence(Qt.Key_Right), self)
         sc_right.activated.connect(lambda: self.step(1))
+        sc_undo = QShortcut(QKeySequence(QKeySequence.StandardKey.Undo), self)
+        sc_undo.setAutoRepeat(False)
+        sc_undo.activated.connect(self.undo_edit)
 
     def _connect(self):
         self.btn_save.clicked.connect(self.save_and_next)
@@ -154,6 +153,8 @@ class MainWindow(QMainWindow):
         self.btn_next.clicked.connect(lambda: self.load_video(self.index + 1))
         self.timeline.seekRequested.connect(self.on_seek)
         self.timeline.segmentClicked.connect(self.on_segment_clicked)
+        self.timeline.segmentDragStarted.connect(self.on_segment_drag_started)
+        self.timeline.segmentEdited.connect(self.on_segment_edited)
         self.video_view.boxChanged.connect(self.on_box_changed)
         self.sidebar.itemClicked.connect(self.on_sidebar_clicked)
 
@@ -172,63 +173,62 @@ class MainWindow(QMainWindow):
             done = os.path.exists(os.path.join(self.cfg.out_dir, f"{vid}.json"))
             item = QListWidgetItem(("✓ " if done else "") + str(vid))
             item.setToolTip(fn)
-            item.setData(Qt.UserRole, vid)
             self.sidebar.addItem(item)
 
-    def _select_sidebar_row(self):
-        for i in range(self.sidebar.count()):
-            if self.sidebar.item(i).data(Qt.UserRole) == self.vid:
-                self.sidebar.setCurrentItem(self.sidebar.item(i))
-                break
-
     def on_sidebar_clicked(self, item):
-        vid = item.data(Qt.UserRole)
-        for i, (v, fn, path) in enumerate(self.video_list):
-            if v == vid:
-                self.load_video(i)
-                break
+        index = self.sidebar.row(item)
+        if index != self.index:
+            self.load_video(index)
 
     def load_video(self, index):
+        if self._prog is not None or not 0 <= index < len(self.video_list):
+            return False
+        if self._playing:
+            self.toggle_play()
+
+        vid, fn, path = self.video_list[index]
+        try:
+            saved = load_saved_annotation(self.cfg.out_dir, vid)
+            if saved is not None:
+                rw, rh = saved["targetRatioWH"]
+                segments = saved_predictions_to_model(saved["predictions"])
+            else:
+                prefill = self.prefill.get(vid, {})
+                ratio = (load_ratio(self.cfg.ratio_dir, vid) or prefill.get("targetRatioWH")
+                         or self.cfg.default_ratio or (16, 9))
+                rw, rh = map(int, ratio)
+                segments = predictions_to_model(prefill.get("predictions") or [])
+            reader = VideoReader(path)
+            if saved is not None and any(seg.end >= reader.total for seg in segments):
+                reader.release()
+                raise ValueError("已保存标注的帧号超出了当前视频长度")
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            self.sidebar.setCurrentRow(self.index)
+            QMessageBox.critical(self, "载入失败", f"无法载入视频 {vid}：{exc}")
+            return False
+
         if self.reader:
             self.reader.release()
-        index = max(0, min(index, len(self.video_list) - 1))
+        self.reader = reader
         self.index = index
-        self.vid, fn, path = self.video_list[index]
-        self.title_lbl.setText(f"视频编号 {self.vid}")
+        self.vid = vid
+        self.title_lbl.setText(f"视频编号 {vid}")
         self.progress_lbl.setText(f"第 {index + 1} / {len(self.video_list)} 个 · {fn}")
 
-        try:
-            self.reader = VideoReader(path)
-        except Exception as e:
-            QMessageBox.critical(self, "错误", str(e))
-            return
-
-        # 比例：官方比例文件夹(必填) > 预填文件 > 默认 16:9
-        r = load_ratio(self.cfg.ratio_dir, self.vid)
-        if r is None and self.vid in self.prefill:
-            r = self.prefill[self.vid].get("targetRatioWH")
-        if r is None:
-            r = self.cfg.default_ratio
-        self.rw, self.rh = int(r[0]), int(r[1])
-        self.video_view.set_ratio(self.rw, self.rh)
-
-        # 预填
-        self.segments = []
+        self.rw, self.rh = rw, rh
+        self.video_view.set_ratio(rw, rh)
+        self.timeline.reset_interaction()
+        self._undo_history.clear()
+        self.segments = segments
         self.open_start = None
-        self.selected = -1
-        if self.vid in self.prefill and self.prefill[self.vid].get("predictions"):
-            self.segments = predictions_to_model(self.prefill[self.vid]["predictions"])
-            # 确保每段有关键帧
-            for seg in self.segments:
-                if not seg.keyframes:
-                    seg.keyframes = [default_keyframe(seg.start, self.reader.w,
-                                                      self.reader.h, self.rw, self.rh)]
-
+        self.selected = 0 if saved is not None and segments else -1
+        self.playhead = segments[0].start if self.selected == 0 else 0
         self._set_preview_size()
-        self.playhead = 0
         self.refresh()
-        self._populate_sidebar()
-        self._select_sidebar_row()
+        self.sidebar.item(index).setText(("✓ " if saved is not None else "") + str(vid))
+        self.sidebar.setCurrentRow(index)
+        self.btn_save.setEnabled(True)
+        return True
 
     def _set_preview_size(self):
         pw = int(360 * self.rw / self.rh)
@@ -266,10 +266,7 @@ class MainWindow(QMainWindow):
             self.video_view.interactive = False
             self._preview_blank()
 
-        seg_ranges = [(s.start, s.end) for s in self.segments]
-        kf_frames = [k.frame for s in self.segments for k in s.keyframes]
-        self.timeline.set_data(self.reader.total, self.reader.fps, seg_ranges,
-                               kf_frames, self.playhead, self.selected)
+        self._refresh_timeline()
         self._update_mark_btn()
 
     def _update_preview(self, frame, x, y, w, h):
@@ -309,6 +306,25 @@ class MainWindow(QMainWindow):
         self.selected = idx
         self._refresh_timeline()
 
+    def on_segment_drag_started(self):
+        if self._playing:
+            self.toggle_play()
+
+    def on_segment_edited(self, index, mode, start, end, playhead):
+        if self._prog is not None or not self.reader or not 0 <= index < len(self.segments):
+            return
+        segment = self.segments[index]
+        if (start, end) == (segment.start, segment.end):
+            return
+        self._remember_edit()
+        if mode == "move":
+            self.segments[index] = move_segment(segment, start)
+        else:
+            self.segments[index] = resize_segment(segment, start, end)
+        self.selected = index
+        self.playhead = playhead
+        self.refresh()
+
     def step(self, d):
         if self.reader:
             self.playhead = max(0, min(self.reader.total - 1, self.playhead + d))
@@ -342,15 +358,29 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     # ---------------- 打标 ----------------
+    def _remember_edit(self):
+        self._undo_history.append((deepcopy(self.segments), self.open_start, self.playhead, self.selected))
+
+    def undo_edit(self):
+        if not self.reader or self._prog is not None or not self._undo_history:
+            return
+        if self._playing:
+            self.toggle_play()
+        self.timeline.reset_interaction()
+        self.video_view.reset_interaction()
+        self.segments, self.open_start, self.playhead, self.selected = self._undo_history.pop()
+        self.refresh()
+
     def toggle_mark(self):
         if not self.reader:
             return
+        if self.open_start is not None and self.playhead <= self.open_start:
+            QMessageBox.warning(self, "提示", "终点必须在起点之后。")
+            return
+        self._remember_edit()
         if self.open_start is None:
             self.open_start = self.playhead
         else:
-            if self.playhead <= self.open_start:
-                QMessageBox.warning(self, "提示", "终点必须在起点之后。")
-                return
             seg = Segment(self.open_start, self.playhead,
                           [default_keyframe(self.open_start, self.reader.w,
                                             self.reader.h, self.rw, self.rh)])
@@ -363,9 +393,12 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def undo_mark(self):
+        if self.open_start is None and not self.segments:
+            return
+        self._remember_edit()
         if self.open_start is not None:
             self.open_start = None
-        elif self.segments:
+        else:
             seg = self._segment_at(self.playhead)
             if seg is not None:
                 self.segments.remove(seg)   # 删播放头所在的那段
@@ -380,15 +413,16 @@ class MainWindow(QMainWindow):
         seg = self._segment_at(self.playhead)
         if seg is None:
             return
-        updated = False
-        for k in seg.keyframes:
-            if k.frame == self.playhead:
-                k.x, k.y, k.w = int(x), int(y), int(w)
-                updated = True
-                break
-        if not updated:
-            seg.keyframes.append(Keyframe(self.playhead, int(x), int(y), int(w)))
+        box = (int(x), int(y), int(w))
+        keyframe = next((k for k in seg.keyframes if k.frame == self.playhead), None)
+        if keyframe is not None and (keyframe.x, keyframe.y, keyframe.w) == box:
+            return
+        self._remember_edit()
+        if keyframe is None:
+            seg.keyframes.append(Keyframe(self.playhead, *box))
             seg.keyframes.sort(key=lambda k: k.frame)
+        else:
+            keyframe.x, keyframe.y, keyframe.w = box
         self._refresh_timeline()
 
     def add_keyframe(self):
@@ -415,13 +449,14 @@ class MainWindow(QMainWindow):
         if abs(nearest.frame - self.playhead) > 3:
             QMessageBox.warning(self, "提示", "当前播放头附近没有关键帧可删。")
             return
+        self._remember_edit()
         seg.keyframes.remove(nearest)
         self._refresh_timeline()
         self.refresh()
 
     # ---------------- 保存 ----------------
     def save_and_next(self):
-        if not self.reader:
+        if not self.reader or self._prog is not None:
             return
         if not self.segments and self.open_start is None:
             ret = QMessageBox.question(self, "确认", "当前没有标注任何高光，仍要保存空结果吗？")
@@ -433,29 +468,39 @@ class MainWindow(QMainWindow):
 
         predictions = segments_to_predictions(self.segments, self.rw, self.rh)
         out_dir = self.cfg.out_dir
-        os.makedirs(out_dir, exist_ok=True)
-        save_video_json(self.vid, self.rw, self.rh, predictions, out_dir)
-        append_jsonl(self.vid, self.rw, self.rh, predictions, out_dir)
+        try:
+            save_video_json(self.vid, self.rw, self.rh, predictions, out_dir)
+            self.sidebar.item(self.index).setText(f"✓ {self.vid}")
+            update_jsonl(self.vid, self.rw, self.rh, predictions, out_dir)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "保存失败", str(exc))
+            return
 
         out_mp4 = os.path.join(out_dir, f"{self.vid}.mp4")
         video_path = self.video_list[self.index][2]
 
-        self._busy = True
+        if self._playing:
+            self.toggle_play()
         self.btn_save.setEnabled(False)
         self._prog = QProgressDialog("正在生成对比视频…", None, 0, self.reader.total, self)
         self._prog.setWindowModality(Qt.WindowModal)
         self._prog.setCancelButton(None)
+        self._prog.setAutoClose(False)
+        self._prog.setAutoReset(False)
         self._prog.show()
 
         t = threading.Thread(target=self._render_thread,
-                             args=(video_path, self.segments, self.rw, self.rh, out_mp4),
+                             args=(video_path, deepcopy(self.segments), self.rw, self.rh, out_mp4),
                              daemon=True)
         t.start()
 
     def _render_thread(self, video_path, segments, rw, rh, out_mp4):
         try:
-            render_comparison(video_path, segments, rw, rh, out_mp4,
-                              progress_cb=lambda a, b: self._progress.emit(a, b))
+            with tempfile.TemporaryDirectory(dir=os.path.dirname(out_mp4)) as tmp:
+                temp_mp4 = os.path.join(tmp, os.path.basename(out_mp4))
+                render_comparison(video_path, segments, rw, rh, temp_mp4,
+                                  progress_cb=lambda a, b: self._progress.emit(a, b))
+                os.replace(temp_mp4, out_mp4)
             self._done.emit(out_mp4)
         except Exception as e:
             self._error.emit(str(e))
@@ -468,6 +513,7 @@ class MainWindow(QMainWindow):
     def _on_done(self, out_mp4):
         self._prog.close()
         self._prog = None
+        self._undo_history.clear()
         self.btn_save.setEnabled(True)
         if self.index + 1 < len(self.video_list):
             self.load_video(self.index + 1)
@@ -482,8 +528,33 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "导出失败", f"对比视频生成失败：{msg}\n（json 已保存）")
 
     def reload(self, cfg, video_list, prefill):
+        if self._playing:
+            self.toggle_play()
+        self._undo_history.clear()
+        if self.reader:
+            self.reader.release()
+            self.reader = None
+        self.vid = None
+        self.index = -1
         self.cfg = cfg
         self.video_list = video_list
         self.prefill = prefill
-        start = self._first_unannotated()
-        self.load_video(start)
+        self._populate_sidebar()
+        if video_list and self.load_video(self._first_unannotated()):
+            return
+
+        self.segments = []
+        self.open_start = None
+        self.selected = -1
+        self.playhead = 0
+        self.title_lbl.setText("视频编号 -")
+        self.progress_lbl.clear()
+        self.video_view.set_frame(None)
+        self.video_view.set_box(None)
+        self.video_view.interactive = False
+        self.preview.clear()
+        self.timeline.set_data(0, 30.0, [], [], 0, -1)
+        self._update_mark_btn()
+        self.btn_save.setEnabled(False)
+        if not video_list:
+            QMessageBox.critical(self, "错误", "源视频文件夹里没有找到视频。")
