@@ -22,7 +22,7 @@ from model import (
     predictions_to_model, saved_predictions_to_model, segments_to_predictions,
 )
 from config import load_ratio, load_saved_annotation
-from exporter import save_video_json, update_jsonl, render_comparison
+from exporter import save_video_json, update_jsonl, render_comparison, render_dual_comparison
 
 
 class MainWindow(QMainWindow):
@@ -32,7 +32,7 @@ class MainWindow(QMainWindow):
     _done = Signal(str)
     _error = Signal(str)
 
-    def __init__(self, cfg, video_list, prefill):
+    def __init__(self, cfg, video_list, prefill, compare=None):
         super().__init__()
         self.reader = None
         self.vid = None
@@ -43,9 +43,13 @@ class MainWindow(QMainWindow):
         self.playhead = 0
         self.selected = -1
         self._undo_history = []
+        self.compare = {}           # 对比预设 {vid: entry}
+        self.compare_segments = []  # 当前视频的 AI 段 [(start, end)]
+        self.compare_boxes = {}     # 当前视频的 AI 框 {frame: (x, y, w)}
 
         self._playing = False
         self._prog = None
+        self._pending_action = None  # "save" / "compare"
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
@@ -56,7 +60,7 @@ class MainWindow(QMainWindow):
         self._done.connect(self._on_done)
         self._error.connect(self._on_error)
 
-        self.reload(cfg, video_list, prefill)
+        self.reload(cfg, video_list, prefill, compare)
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -76,12 +80,15 @@ class MainWindow(QMainWindow):
         self.progress_lbl.setStyleSheet("color:#888;")
         btn_set = QPushButton("设置…")
         btn_set.clicked.connect(lambda: self.settingsRequested.emit())
+        self.btn_export_compare = QPushButton("导出对比视频")
+        self.btn_export_compare.setEnabled(False)
         self.btn_save = QPushButton("✓ 保存并下一个")
         self.btn_save.setStyleSheet("background:#1e8e3e; color:white; padding:6px 14px;")
         top.addWidget(self.title_lbl)
         top.addSpacing(16)
         top.addWidget(self.progress_lbl)
         top.addStretch(1)
+        top.addWidget(self.btn_export_compare)
         top.addWidget(btn_set)
         top.addWidget(self.btn_save)
         root.addLayout(top)
@@ -125,9 +132,19 @@ class MainWindow(QMainWindow):
         btns.addWidget(self.btn_next)
         root.addLayout(btns)
 
-        # 时间轴
+        # 时间轴：上人工（可编辑），下 AI 对比（只读）
+        lbl_manual = QLabel("人工")
+        lbl_manual.setStyleSheet("color:#4caf50; font-weight:bold;")
+        root.addWidget(lbl_manual)
         self.timeline = TimelineView()
         root.addWidget(self.timeline)
+
+        lbl_ai = QLabel("AI 对比")
+        lbl_ai.setStyleSheet("color:#ff8c00; font-weight:bold;")
+        root.addWidget(lbl_ai)
+        self.compare_timeline = TimelineView()
+        self.compare_timeline.set_read_only(True)
+        root.addWidget(self.compare_timeline)
 
         self.setCentralWidget(central)
 
@@ -144,6 +161,7 @@ class MainWindow(QMainWindow):
 
     def _connect(self):
         self.btn_save.clicked.connect(self.save_and_next)
+        self.btn_export_compare.clicked.connect(self.export_compare_video)
         self.btn_play.clicked.connect(self.toggle_play)
         self.btn_mark.clicked.connect(self.toggle_mark)
         self.btn_add_kf.clicked.connect(self.add_keyframe)
@@ -223,6 +241,8 @@ class MainWindow(QMainWindow):
         self.open_start = None
         self.selected = 0 if saved is not None and segments else -1
         self.playhead = segments[0].start if self.selected == 0 else 0
+        self._build_compare_data()
+        self.btn_export_compare.setEnabled(bool(self.compare_boxes))
         self._set_preview_size()
         self.refresh()
         self.sidebar.item(index).setText(("✓ " if saved is not None else "") + str(vid))
@@ -234,6 +254,20 @@ class MainWindow(QMainWindow):
         pw = int(360 * self.rw / self.rh)
         pw = max(180, min(820, pw))
         self.preview.setFixedSize(pw, 360)
+
+    def _build_compare_data(self):
+        """从对比预设构建当前视频的 AI 段与逐帧框。"""
+        entry = self.compare.get(self.vid)
+        if not entry:
+            self.compare_segments = []
+            self.compare_boxes = {}
+            return
+        preds = entry.get("predictions") or []
+        self.compare_boxes = {
+            int(p["frame"]): (int(p["bboxes"][0]), int(p["bboxes"][1]), int(p["bboxes"][2]))
+            for p in preds
+        }
+        self.compare_segments = [(s.start, s.end) for s in predictions_to_model(preds)]
 
     # ---------------- 刷新 ----------------
     def _segment_at(self, frame):
@@ -265,6 +299,18 @@ class MainWindow(QMainWindow):
             self.video_view.set_box(None)
             self.video_view.interactive = False
             self._preview_blank()
+
+        # 对比框（橙色）
+        if self.playhead in self.compare_boxes:
+            x, y, w = self.compare_boxes[self.playhead]
+            h = box_height(w, self.rw, self.rh)
+            self.video_view.set_compare_box((x, y, w, h))
+        else:
+            self.video_view.set_compare_box(None)
+
+        # AI 对比时间轴
+        self.compare_timeline.set_data(self.reader.total, self.reader.fps,
+                                       self.compare_segments, [], self.playhead, -1)
 
         self._refresh_timeline()
         self._update_mark_btn()
@@ -489,6 +535,7 @@ class MainWindow(QMainWindow):
         self._prog.setAutoReset(False)
         self._prog.show()
 
+        self._pending_action = "save"
         t = threading.Thread(target=self._render_thread,
                              args=(video_path, deepcopy(self.segments), self.rw, self.rh, out_mp4),
                              daemon=True)
@@ -505,6 +552,51 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._error.emit(str(e))
 
+    def export_compare_video(self):
+        """导出人工 vs AI 双预设对比视频。"""
+        if not self.reader or self._prog is not None:
+            return
+        if not self.compare_boxes:
+            QMessageBox.warning(self, "提示", "当前视频没有「对比预设」，无法导出对比视频。")
+            return
+        if not self.segments:
+            QMessageBox.warning(self, "提示", "当前没有人工标注。")
+            return
+
+        out_mp4 = os.path.join(self.cfg.out_dir, f"{self.vid}_compare.mp4")
+        video_path = self.video_list[self.index][2]
+
+        if self._playing:
+            self.toggle_play()
+        self.btn_export_compare.setEnabled(False)
+        self._prog = QProgressDialog("正在生成对比视频…", None, 0, self.reader.total, self)
+        self._prog.setWindowModality(Qt.WindowModal)
+        self._prog.setCancelButton(None)
+        self._prog.setAutoClose(False)
+        self._prog.setAutoReset(False)
+        self._prog.show()
+
+        self._pending_action = "compare"
+        t = threading.Thread(
+            target=self._compare_render_thread,
+            args=(video_path, deepcopy(self.segments),
+                  list(self.compare_segments), dict(self.compare_boxes),
+                  self.rw, self.rh, out_mp4),
+            daemon=True)
+        t.start()
+
+    def _compare_render_thread(self, video_path, segments, ai_segments, ai_boxes, rw, rh, out_mp4):
+        try:
+            with tempfile.TemporaryDirectory(dir=os.path.dirname(out_mp4)) as tmp:
+                temp_mp4 = os.path.join(tmp, os.path.basename(out_mp4))
+                render_dual_comparison(video_path, segments, ai_segments, ai_boxes,
+                                       rw, rh, temp_mp4,
+                                       progress_cb=lambda a, b: self._progress.emit(a, b))
+                os.replace(temp_mp4, out_mp4)
+            self._done.emit(out_mp4)
+        except Exception as e:
+            self._error.emit(str(e))
+
     def _on_progress(self, a, b):
         if self._prog is not None:
             self._prog.setMaximum(b)
@@ -513,6 +605,12 @@ class MainWindow(QMainWindow):
     def _on_done(self, out_mp4):
         self._prog.close()
         self._prog = None
+        action = self._pending_action
+        self._pending_action = None
+        if action == "compare":
+            self.btn_export_compare.setEnabled(True)
+            QMessageBox.information(self, "完成", f"对比视频已生成：\n{out_mp4}")
+            return
         self._undo_history.clear()
         self.btn_save.setEnabled(True)
         if self.index + 1 < len(self.video_list):
@@ -524,10 +622,16 @@ class MainWindow(QMainWindow):
     def _on_error(self, msg):
         self._prog.close()
         self._prog = None
-        self.btn_save.setEnabled(True)
-        QMessageBox.critical(self, "导出失败", f"对比视频生成失败：{msg}\n（json 已保存）")
+        action = self._pending_action
+        self._pending_action = None
+        if action == "compare":
+            self.btn_export_compare.setEnabled(True)
+            QMessageBox.critical(self, "导出失败", f"对比视频生成失败：{msg}")
+        else:
+            self.btn_save.setEnabled(True)
+            QMessageBox.critical(self, "导出失败", f"对比视频生成失败：{msg}\n（json 已保存）")
 
-    def reload(self, cfg, video_list, prefill):
+    def reload(self, cfg, video_list, prefill, compare=None):
         if self._playing:
             self.toggle_play()
         self._undo_history.clear()
@@ -539,6 +643,7 @@ class MainWindow(QMainWindow):
         self.cfg = cfg
         self.video_list = video_list
         self.prefill = prefill
+        self.compare = compare or {}
         self._populate_sidebar()
         if video_list and self.load_video(self._first_unannotated()):
             return
@@ -547,14 +652,19 @@ class MainWindow(QMainWindow):
         self.open_start = None
         self.selected = -1
         self.playhead = 0
+        self.compare_segments = []
+        self.compare_boxes = {}
         self.title_lbl.setText("视频编号 -")
         self.progress_lbl.clear()
         self.video_view.set_frame(None)
         self.video_view.set_box(None)
+        self.video_view.set_compare_box(None)
         self.video_view.interactive = False
         self.preview.clear()
         self.timeline.set_data(0, 30.0, [], [], 0, -1)
+        self.compare_timeline.set_data(0, 30.0, [], [], 0, -1)
         self._update_mark_btn()
         self.btn_save.setEnabled(False)
+        self.btn_export_compare.setEnabled(False)
         if not video_list:
             QMessageBox.critical(self, "错误", "源视频文件夹里没有找到视频。")

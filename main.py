@@ -21,6 +21,7 @@ class SetupDialog(QDialog):
         self.src = QLineEdit(cfg.source_dir)
         self.ratio = QLineEdit(cfg.ratio_dir)
         self.prefill = QLineEdit(cfg.prefill_jsonl)
+        self.compare = QLineEdit(cfg.compare_jsonl)
         self.out = QLineEdit(cfg.out_dir)
 
         grid = QGridLayout()
@@ -36,9 +37,13 @@ class SetupDialog(QDialog):
         grid.addWidget(self.prefill, 2, 1)
         grid.addWidget(self._browse_file(self.prefill), 2, 2)
 
-        grid.addWidget(QLabel("输出文件夹："), 3, 0)
-        grid.addWidget(self.out, 3, 1)
-        grid.addWidget(self._browse_dir(self.out), 3, 2)
+        grid.addWidget(QLabel("对比预设 jsonl(可选)："), 3, 0)
+        grid.addWidget(self.compare, 3, 1)
+        grid.addWidget(self._browse_file(self.compare), 3, 2)
+
+        grid.addWidget(QLabel("输出文件夹："), 4, 0)
+        grid.addWidget(self.out, 4, 1)
+        grid.addWidget(self._browse_dir(self.out), 4, 2)
 
         btns = QHBoxLayout()
         ok = QPushButton("开始")
@@ -91,6 +96,7 @@ class SetupDialog(QDialog):
         self.cfg.source_dir = src
         self.cfg.ratio_dir = ratio
         self.cfg.prefill_jsonl = self.prefill.text().strip()
+        self.cfg.compare_jsonl = self.compare.text().strip()
         self.cfg.out_dir = out
         self.cfg.save()
         self.accept()
@@ -106,15 +112,17 @@ def main():
             return 0
 
     prefill = load_prefill(cfg.prefill_jsonl)
+    compare = load_prefill(cfg.compare_jsonl)
     video_list = scan_videos(cfg.source_dir)
-    win = MainWindow(cfg, video_list, prefill)
+    win = MainWindow(cfg, video_list, prefill, compare)
 
     def on_settings():
         dlg = SetupDialog(cfg)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             prefill = load_prefill(cfg.prefill_jsonl)
+            compare = load_prefill(cfg.compare_jsonl)
             video_list = scan_videos(cfg.source_dir)
-            win.reload(cfg, video_list, prefill)
+            win.reload(cfg, video_list, prefill, compare)
 
     win.settingsRequested.connect(on_settings)
     win.show()

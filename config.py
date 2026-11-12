@@ -15,6 +15,7 @@ class Config:
     source_dir: str = ""      # 源视频文件夹
     ratio_dir: str = ""       # 必填：官方比例文件夹（{id}.jsonl，每行 {"targetRatioWH":[w,h]}）
     prefill_jsonl: str = ""   # 可选：预填结果 jsonl（空 = 不预填，自动初始化）
+    compare_jsonl: str = ""   # 可选：对比预设 jsonl（AI/原预设，用于双时间轴与双裁剪框对比）
     out_dir: str = ""         # 输出文件夹（json + 对比视频 + annotations.jsonl）
     default_ratio: list = field(default_factory=lambda: [16, 9])
 

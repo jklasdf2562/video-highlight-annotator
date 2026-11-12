@@ -24,7 +24,8 @@ class VideoView(QWidget):
         self._pixmap = None      # QPixmap（原分辨率）
         self._src_w = 0
         self._src_h = 0
-        self._box = None         # (x, y, w, h) 源坐标
+        self._box = None         # (x, y, w, h) 源坐标（人工，绿色）
+        self._compare_box = None # (x, y, w, h) 源坐标（对比预设，橙色）
         self.rw, self.rh = 16, 9
         self.interactive = False  # 仅高光帧允许拖动
 
@@ -53,6 +54,10 @@ class VideoView(QWidget):
 
     def set_box(self, box):
         self._box = box
+        self.update()
+
+    def set_compare_box(self, box):
+        self._compare_box = box
         self.update()
 
     def set_ratio(self, rw, rh):
@@ -92,31 +97,38 @@ class VideoView(QWidget):
         ph = self._pixmap.height()
         p.drawPixmap(QRectF(ox, oy, sw, sh), self._pixmap, QRectF(0, 0, pw, ph))
 
-        if self._box is None:
-            return
-        x, y, w, h = self._box
-        wx, wy, ww, wh = ox + x * s, oy + y * s, w * s, h * s
+        # 人工框（绿色，框外压暗）
+        if self._box is not None:
+            x, y, w, h = self._box
+            wx, wy, ww, wh = ox + x * s, oy + y * s, w * s, h * s
+            dim = QColor(0, 0, 0, 150)
+            p.fillRect(QRectF(ox, oy, sw, wy - oy), dim)                              # top
+            p.fillRect(QRectF(ox, wy + wh, sw, (oy + sh) - (wy + wh)), dim)           # bottom
+            p.fillRect(QRectF(ox, wy, wx - ox, wh), dim)                              # left
+            p.fillRect(QRectF(wx + ww, wy, (ox + sw) - (wx + ww), wh), dim)           # right
+            pen = QPen(QColor(0, 210, 90), 2)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(QRectF(wx, wy, ww, wh))
+            p.setBrush(QColor(0, 210, 90))
+            r = 5
+            for cx, cy in ((wx, wy), (wx + ww, wy), (wx, wy + wh), (wx + ww, wy + wh)):
+                p.drawRect(QRectF(cx - r / 2, cy - r / 2, r, r))
+            p.drawRect(QRectF(wx + ww - self._handle / 2, wy + wh - self._handle / 2,
+                              self._handle, self._handle))
 
-        # 框外压暗
-        dim = QColor(0, 0, 0, 150)
-        p.fillRect(QRectF(ox, oy, sw, wy - oy), dim)                              # top
-        p.fillRect(QRectF(ox, wy + wh, sw, (oy + sh) - (wy + wh)), dim)           # bottom
-        p.fillRect(QRectF(ox, wy, wx - ox, wh), dim)                              # left
-        p.fillRect(QRectF(wx + ww, wy, (ox + sw) - (wx + ww), wh), dim)           # right
-
-        # 绿色框
-        pen = QPen(QColor(0, 210, 90), 2)
-        p.setPen(pen)
-        p.setBrush(Qt.NoBrush)
-        p.drawRect(QRectF(wx, wy, ww, wh))
-
-        # 四个角 + 右下角手柄
-        p.setBrush(QColor(0, 210, 90))
-        r = 5
-        for cx, cy in ((wx, wy), (wx + ww, wy), (wx, wy + wh), (wx + ww, wy + wh)):
-            p.drawRect(QRectF(cx - r / 2, cy - r / 2, r, r))
-        p.drawRect(QRectF(wx + ww - self._handle / 2, wy + wh - self._handle / 2,
-                          self._handle, self._handle))
+        # 对比框（橙色，仅描边 + 四角，不压暗）
+        if self._compare_box is not None:
+            x, y, w, h = self._compare_box
+            wx, wy, ww, wh = ox + x * s, oy + y * s, w * s, h * s
+            pen = QPen(QColor(255, 140, 0), 3)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(QRectF(wx, wy, ww, wh))
+            p.setBrush(QColor(255, 140, 0))
+            r = 6
+            for cx, cy in ((wx, wy), (wx + ww, wy), (wx, wy + wh), (wx + ww, wy + wh)):
+                p.drawRect(QRectF(cx - r / 2, cy - r / 2, r, r))
 
     # ---- 交互 ----
     def mousePressEvent(self, e):
@@ -216,9 +228,14 @@ class TimelineView(QWidget):
         self._scrubbing = False
         self._drag = None  # (index, mode, press_x, press_frame)
         self._drag_range = None
+        self.read_only = False  # 只读模式（用于展示 AI 对比时间轴，不接受交互）
         self.setMinimumHeight(92)
         self.setMouseTracking(True)
         self.setToolTip("拖动高光两端调整起止帧，拖动中间移动整段。拖动刻度或空白处定位。")
+
+    def set_read_only(self, flag):
+        self.read_only = flag
+        self.reset_interaction()
 
     def set_data(self, total, fps, segments, keyframes, playhead, selected):
         if self.total != total or self.segments != segments:
@@ -349,6 +366,8 @@ class TimelineView(QWidget):
             self.setCursor(Qt.SizeHorCursor)
 
     def mousePressEvent(self, e):
+        if self.read_only:
+            return
         if e.button() != Qt.LeftButton or self.total <= 0:
             return
         self.reset_interaction()
@@ -372,6 +391,8 @@ class TimelineView(QWidget):
         self._seek(frame, index)
 
     def mouseMoveEvent(self, e):
+        if self.read_only:
+            return
         px, py = e.position().x(), e.position().y()
         if e.buttons() & Qt.LeftButton:
             if self._drag is not None:
